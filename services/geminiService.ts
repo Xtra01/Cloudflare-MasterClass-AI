@@ -1,44 +1,31 @@
 import { GoogleGenAI, Type } from "@google/genai";
-import { GeneratedContent } from '../types';
+import { GeneratedContent, ChatMessage } from '../types';
 
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-const SYSTEM_INSTRUCTION = `
-Sen Dünyanın en iyi Cloudflare Çözüm Mimarı ve "MasterClass" eğitmenisin.
-Görevin: Kullanıcıya Cloudflare araçlarını teknik derinliği yüksek, profesyonel ve eksiksiz bir şekilde öğretmek.
+const INSTRUCTOR_PERSONA = `
+Sen Cloudflare MasterClass Eğitmenisin.
+Tarzın: Profesyonel, teknik derinliği yüksek ama anlaşılır.
+Kullanıcı bir öğrenci veya sistem yöneticisi olabilir.
+Yanıtların kısa, öz ve çözüm odaklı olmalı. Markdown kullanabilirsin.
+`;
 
-Format Kuralları:
-1. İçerik "Dokümantasyon" kalitesinde olmalı, blog yazısı gibi değil.
-2. Kesinlikle Markdown formatı kullan.
-3. Her başlık altında:
-   - **Teknik Detay**: Nasıl çalışır? (Arka plandaki teknoloji).
-   - **Konfigürasyon**: CLI (Wrangler/Terraform) veya Dashboard adımları.
-   - **Kod Örnekleri**: JavaScript/TypeScript (Workers), JSON (Rules), HCL (Terraform).
-   - **Gerçek Hayat Senaryosu**: Büyük ölçekli bir şirket bunu nasıl kullanır?
-4. **"MasterClass Pro Tip"**: Her bölümün sonunda sadece uzmanların bildiği, dokümantasyonda zor bulunan bir ipucu ver.
-5. **Görselleştirme**: Mümkünse ASCII diyagramları ile akışı (flow) çiz.
-
-Üslup:
-- Otoriter ama yardımsever.
-- "Bunu yapabilirsiniz" yerine "Bunu şu şekilde yapılandırın" gibi net yönergeler kullan.
-- Türkçe terminolojiye hakim ol ama teknik terimleri (Edge, Cache, Handshake) orijinal İngilizce halleriyle parantez içinde belirt.
+const CONTENT_GENERATION_INSTRUCTION = `
+${INSTRUCTOR_PERSONA}
+Görevin: Kullanıcıya Cloudflare konusunu eksiksiz bir "Dokümantasyon/Tutorial" formatında sunmak.
+Format:
+1. Başlık ve Özet
+2. Teknik Mimari (Derinlemesine)
+3. Konfigürasyon / Kod Örnekleri
+4. Pro Tip (Sadece uzmanların bildiği)
 `;
 
 export const generateTutorialContent = async (topicTitle: string, level: string): Promise<GeneratedContent> => {
   const prompt = `
-  EĞİTİM KONUSU: ${topicTitle}
-  HEDEF SEVİYE: ${level}
+  KONU: ${topicTitle}
+  SEVİYE: ${level}
 
-  Lütfen bu konu için eksiksiz, indirilebilir bir PDF kalitesinde eğitim modülü oluştur.
-  Kullanıcı bu çıktıyı okuduğunda konuya tamamen hakim olmalı.
-
-  Yapı:
-  1. **Yönetici Özeti**: 2 cümle ile nedir?
-  2. **Mimari ve Çalışma Prensibi**: Teknik derinlemesine bakış.
-  3. **Adım Adım Kurulum**: (Dashboard ve CLI/API alternatifleriyle).
-  4. **Production Readiness**: Canlıya almadan önce checklist.
-  5. **Common Pitfalls**: Sık yapılan hatalar ve çözümleri.
-  6. **Maliyet ve Limitler**: Free vs Enterprise farkları.
+  Lütfen bu konu için Markdown formatında kapsamlı bir eğitim içeriği oluştur.
   `;
 
   try {
@@ -46,17 +33,16 @@ export const generateTutorialContent = async (topicTitle: string, level: string)
       model: "gemini-2.5-flash",
       contents: prompt,
       config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
+        systemInstruction: CONTENT_GENERATION_INSTRUCTION,
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
           properties: {
             title: { type: Type.STRING },
-            content: { type: Type.STRING, description: "Rich markdown content with diagrams and code" },
+            content: { type: Type.STRING },
             relatedTopics: { 
               type: Type.ARRAY, 
               items: { type: Type.STRING },
-              description: "3 specific follow-up questions for deep dive"
             }
           },
           required: ["title", "content", "relatedTopics"]
@@ -71,48 +57,54 @@ export const generateTutorialContent = async (topicTitle: string, level: string)
   } catch (error) {
     console.error("Gemini API Error:", error);
     return {
-      title: "Servis Bağlantı Hatası",
-      content: "Şu anda içeriğe erişilemiyor. Lütfen internet bağlantınızı kontrol edin veya daha sonra tekrar deneyin.\n\n```bash\nError: API_CONNECTION_TIMEOUT\n```",
+      title: "Hata",
+      content: "İçerik oluşturulurken bir hata meydana geldi.",
       relatedTopics: []
     };
   }
 };
 
-export const generateDeepDive = async (currentContext: string, specificQuery: string): Promise<GeneratedContent> => {
-  const prompt = `
-  MEVCUT KONU: ${currentContext}
-  KULLANICI SORUSU: "${specificQuery}"
+export const chatWithContext = async (
+  message: string, 
+  currentContext: string | null, 
+  history: ChatMessage[]
+): Promise<string> => {
+  
+  const historyParts = history.map(h => ({
+    role: h.role,
+    parts: [{ text: h.text }]
+  }));
 
-  Bu spesifik soru için "Consultant" (Danışman) modunda yanıt ver.
-  Genel geçer bilgiler verme. Doğrudan çözüme, koda ve mimari kararlara odaklan.
-  Varsa performans metrikleri veya benchmark stratejileri ekle.
-  `;
+  const contextPrompt = currentContext 
+    ? `KULLANICININ ŞU AN OKUDUĞU İÇERİK:\n${currentContext.substring(0, 3000)}...\n\n` 
+    : "";
+
+  const finalPrompt = `${contextPrompt}KULLANICI SORUSU: ${message}`;
 
   try {
-     const response = await ai.models.generateContent({
+    const chat = ai.chats.create({
       model: "gemini-2.5-flash",
-      contents: prompt,
       config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            title: { type: Type.STRING },
-            content: { type: Type.STRING },
-            relatedTopics: { type: Type.ARRAY, items: { type: Type.STRING } }
-          }
-        }
-      }
+        systemInstruction: INSTRUCTOR_PERSONA + " Kısa ve net cevaplar ver. Eğer bir kod bloğu seçildiyse onu açıkla.",
+      },
+      history: historyParts
     });
-    const text = response.text;
-    if(!text) throw new Error("No text");
-    return JSON.parse(text) as GeneratedContent;
+
+    const result = await chat.sendMessage({ message: finalPrompt });
+    return result.text || "Cevap alınamadı.";
   } catch (error) {
-    return {
-      title: "Hata",
-      content: "Derinlemesine inceleme yapılamadı.",
-      relatedTopics: []
-    };
+    return "Üzgünüm, şu an bağlantı kuramıyorum.";
   }
+};
+
+// Legacy Deep Dive wrapper (can be repurposed or removed, kept for compatibility)
+export const generateDeepDive = async (currentContext: string, specificQuery: string): Promise<GeneratedContent> => {
+    // This is now effectively handled by the chat, but we keep the structure for "GeneratedContent" type return if needed
+    // or simply reuse the chat logic. For now, let's keep it distinct as a "Full Page Analysis".
+    const responseText = await chatWithContext(specificQuery, currentContext, []);
+    return {
+        title: "Analiz Sonucu",
+        content: responseText,
+        relatedTopics: []
+    };
 };

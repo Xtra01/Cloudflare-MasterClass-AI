@@ -1,34 +1,109 @@
-import React, { useState, useEffect } from 'react';
-import { CLOUDFLARE_CURRICULUM } from './constants';
-import { Category, GeneratedContent, Topic } from './types';
-import { generateTutorialContent, generateDeepDive } from './services/geminiService';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { CLOUDFLARE_CURRICULUM, STATIC_TUTORIALS } from './constants';
+import { Topic, ChatMessage, ContentCache } from './types';
+import { generateTutorialContent, chatWithContext } from './services/geminiService';
 import MarkdownRenderer from './components/MarkdownRenderer';
-import { Logo, ChevronRight, BookOpen, Terminal, Shield, Zap, Database, Lock, Sparkles } from './components/Icons';
+import ChatBubble from './components/ChatBubble';
+import { Logo, ChevronRight, BookOpen, Terminal, Shield, Zap, Database, Lock, Sparkles, Settings, RefreshCw, XCircle, Trash } from './components/Icons';
 
-// Extend window for html2pdf
 declare global {
   interface Window {
     html2pdf: any;
   }
 }
 
+// Maximum number of simultaneous API requests to prevent timeouts/limits
+const MAX_CONCURRENT_REQUESTS = 2;
+
+interface ToastNotification {
+  id: string;
+  title: string;
+  message: string;
+  type: 'success' | 'info' | 'error';
+}
+
 const App: React.FC = () => {
   const [activeCategory, setActiveCategory] = useState<string | null>(CLOUDFLARE_CURRICULUM[0].id);
   const [activeTopic, setActiveTopic] = useState<Topic | null>(null);
-  const [content, setContent] = useState<GeneratedContent | null>(null);
-  const [loading, setLoading] = useState<boolean>(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [deepDiveQuery, setDeepDiveQuery] = useState('');
   const [completedTopics, setCompletedTopics] = useState<string[]>([]);
   const [isPdfGenerating, setIsPdfGenerating] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  
+  // Caching State
+  const [contentCache, setContentCache] = useState<ContentCache>(STATIC_TUTORIALS);
+  
+  // Queue System State
+  const [processingQueue, setProcessingQueue] = useState<Topic[]>([]);
+  const [activeRequests, setActiveRequests] = useState<string[]>([]); // Array of Topic IDs currently fetching
+  
+  // Search State
+  const [searchQuery, setSearchQuery] = useState('');
 
-  // Load completed topics from local storage
+  // Chat State
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [isChatLoading, setIsChatLoading] = useState(false);
+
+  // Notifications
+  const [toasts, setToasts] = useState<ToastNotification[]>([]);
+
   useEffect(() => {
     const saved = localStorage.getItem('cf_masterclass_progress');
     if (saved) {
       setCompletedTopics(JSON.parse(saved));
     }
   }, []);
+
+  // Queue Processor
+  useEffect(() => {
+    const processQueue = async () => {
+      if (processingQueue.length === 0 || activeRequests.length >= MAX_CONCURRENT_REQUESTS) {
+        return;
+      }
+
+      // Get next item from queue
+      const [nextTopic, ...remainingQueue] = processingQueue;
+      
+      // Update states immediately to prevent double processing
+      setProcessingQueue(remainingQueue);
+      setActiveRequests(prev => [...prev, nextTopic.id]);
+
+      try {
+        const result = await generateTutorialContent(nextTopic.title, nextTopic.level);
+        
+        // Update Cache
+        setContentCache(prev => ({
+            ...prev,
+            [nextTopic.id]: result
+        }));
+
+        addToast(nextTopic.id, "İçerik Hazır", `${nextTopic.title} başarıyla oluşturuldu.`, 'success');
+
+      } catch (e) {
+        console.error(e);
+        addToast(nextTopic.id, "Hata", `${nextTopic.title} oluşturulamadı.`, 'error');
+      } finally {
+        // Remove from active requests
+        setActiveRequests(prev => prev.filter(id => id !== nextTopic.id));
+      }
+    };
+
+    processQueue();
+  }, [processingQueue, activeRequests]);
+
+  const addToast = (id: string, title: string, message: string, type: 'success' | 'info' | 'error') => {
+    const toastId = Date.now().toString() + Math.random();
+    setToasts(prev => [...prev, { id: toastId, title, message, type }]);
+    
+    // Auto remove after 5 seconds
+    setTimeout(() => {
+      setToasts(prev => prev.filter(t => t.id !== toastId));
+    }, 5000);
+  };
+
+  const removeToast = (id: string) => {
+    setToasts(prev => prev.filter(t => t.id !== id));
+  };
 
   const toggleComplete = (topicId: string) => {
     let newCompleted;
@@ -41,40 +116,108 @@ const App: React.FC = () => {
     localStorage.setItem('cf_masterclass_progress', JSON.stringify(newCompleted));
   };
 
-  const handleTopicClick = async (topic: Topic) => {
+  // Main interaction handler
+  const handleTopicClick = (topic: Topic) => {
     setActiveTopic(topic);
-    setLoading(true);
-    setContent(null);
-    setDeepDiveQuery('');
     
-    try {
-      const result = await generateTutorialContent(topic.title, topic.level);
-      setContent(result);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setLoading(false);
+    // If content exists, we are good. 
+    // If not, and it's not already in queue/processing, add it.
+    if (!contentCache[topic.id] && !isTopicProcessing(topic.id) && !isTopicQueued(topic.id)) {
+        addToQueue(topic);
     }
   };
 
-  const handleDeepDive = async () => {
-    if (!content || !deepDiveQuery) return;
-    setLoading(true);
+  const handleRegenerate = (topic: Topic) => {
+    addToQueue(topic);
+    addToast(topic.id, "Sıraya Alındı", `${topic.title} güncellenmek üzere sıraya eklendi.`, 'info');
+  };
+
+  const addToQueue = (topic: Topic) => {
+    if (isTopicQueued(topic.id) || isTopicProcessing(topic.id)) return;
+    setProcessingQueue(prev => [...prev, topic]);
+  };
+
+  // Bulk Actions
+  const handleRegenerateCategory = () => {
+    if (!activeCategory) return;
+    const cat = CLOUDFLARE_CURRICULUM.find(c => c.id === activeCategory);
+    if (!cat) return;
+
+    let addedCount = 0;
+    const newItems: Topic[] = [];
+    cat.topics.forEach(t => {
+       if (!isTopicQueued(t.id) && !isTopicProcessing(t.id)) {
+         newItems.push(t);
+         addedCount++;
+       }
+    });
+
+    if (addedCount > 0) {
+        setProcessingQueue(prev => [...prev, ...newItems]);
+        addToast("bulk-cat", "Kategori Güncelleniyor", `${addedCount} konu sıraya eklendi.`, "info");
+    }
+    setIsSettingsOpen(false);
+  };
+
+  const handleRegenerateAll = () => {
+    const allTopics: Topic[] = [];
+    CLOUDFLARE_CURRICULUM.forEach(cat => {
+        cat.topics.forEach(t => allTopics.push(t));
+    });
+
+    const newItems = allTopics.filter(t => !isTopicQueued(t.id) && !isTopicProcessing(t.id));
+
+    if (newItems.length > 0) {
+        setProcessingQueue(prev => [...prev, ...newItems]);
+        addToast("bulk-all", "Tam Yenileme Başlatıldı", `${newItems.length} konu sıraya alındı. Bu işlem zaman alabilir.`, "info");
+    } else {
+        addToast("bulk-all-empty", "Sıra Dolu", "Tüm konular zaten sırada veya işleniyor.", "info");
+    }
+    setIsSettingsOpen(false);
+  };
+
+  const handleResetCache = () => {
+      // Clear queue first
+      setProcessingQueue([]);
+      // Revert to static
+      setContentCache(STATIC_TUTORIALS);
+      addToast("reset", "Fabrika Ayarlarına Dönüldü", "Tüm içerikler varsayılan (hızlı) haline getirildi.", "success");
+      setIsSettingsOpen(false);
+  };
+
+  const handleResetProgress = () => {
+      setCompletedTopics([]);
+      localStorage.removeItem('cf_masterclass_progress');
+      addToast("reset-prog", "İlerleme Sıfırlandı", "Okundu işaretleri kaldırıldı.", "success");
+      setIsSettingsOpen(false);
+  };
+
+  const handleClearQueue = () => {
+      setProcessingQueue([]);
+      addToast("clear-queue", "Kuyruk Temizlendi", "Bekleyen işlemler iptal edildi.", "info");
+  };
+
+  const isTopicProcessing = (id: string) => activeRequests.includes(id);
+  const isTopicQueued = (id: string) => processingQueue.some(t => t.id === id);
+
+  const handleChat = async (text: string) => {
+    const newUserMsg: ChatMessage = { id: Date.now().toString(), role: 'user', text };
+    setChatMessages(prev => [...prev, newUserMsg]);
+    setIsChatLoading(true);
+
+    const currentContentText = activeTopic ? contentCache[activeTopic.id]?.content : null;
+
     try {
-      const result = await generateDeepDive(content.title, deepDiveQuery);
-      setContent({
-        ...result,
-        title: `Derin Analiz: ${result.title}`,
-        relatedTopics: result.relatedTopics
-      });
-      setDeepDiveQuery('');
+        const responseText = await chatWithContext(text, currentContentText, [...chatMessages, newUserMsg]);
+        const newModelMsg: ChatMessage = { id: (Date.now() + 1).toString(), role: 'model', text: responseText };
+        setChatMessages(prev => [...prev, newModelMsg]);
     } finally {
-      setLoading(false);
+        setIsChatLoading(false);
     }
   };
 
   const downloadPDF = () => {
-    if (!content || !window.html2pdf) return;
+    if (!activeTopic || !contentCache[activeTopic.id] || !window.html2pdf) return;
     setIsPdfGenerating(true);
     
     const element = document.getElementById('tutorial-content');
@@ -103,9 +246,21 @@ const App: React.FC = () => {
     }
   };
 
-  // Calculate Progress
-  const totalTopics = CLOUDFLARE_CURRICULUM.reduce((acc, cat) => acc + cat.topics.length, 0);
-  const progressPercentage = Math.round((completedTopics.length / totalTopics) * 100);
+  // Filtered Navigation based on search
+  const filteredCurriculum = useMemo(() => {
+    if (!searchQuery) return CLOUDFLARE_CURRICULUM;
+    const lowerQ = searchQuery.toLowerCase();
+    
+    return CLOUDFLARE_CURRICULUM.map(cat => ({
+        ...cat,
+        topics: cat.topics.filter(t => 
+            t.title.toLowerCase().includes(lowerQ) || 
+            t.description.toLowerCase().includes(lowerQ)
+        )
+    })).filter(cat => cat.topics.length > 0);
+  }, [searchQuery]);
+
+  const activeContent = activeTopic ? contentCache[activeTopic.id] : null;
 
   return (
     <div className="flex h-screen bg-[#0d0d0d] text-gray-100 overflow-hidden font-sans relative">
@@ -113,32 +268,128 @@ const App: React.FC = () => {
       {/* Background Effect */}
       <div className="absolute inset-0 bg-grid opacity-20 pointer-events-none z-0"></div>
 
+      {/* Settings Modal */}
+      {isSettingsOpen && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm animate-fadeIn" onClick={() => setIsSettingsOpen(false)}>
+              <div className="bg-[#1a1a1a] border border-[#333] rounded-xl p-6 w-[400px] shadow-2xl relative" onClick={e => e.stopPropagation()}>
+                  <h3 className="text-xl font-bold text-white mb-6 flex items-center gap-2">
+                      <Settings /> Ayarlar & Araçlar
+                  </h3>
+                  
+                  <div className="space-y-3">
+                      <button onClick={handleRegenerateCategory} className="w-full flex items-center justify-between p-3 bg-[#252525] hover:bg-[#2c2c2c] rounded-lg transition-colors text-left group">
+                          <div>
+                              <div className="text-sm font-semibold text-white group-hover:text-cf-orange">Kategoriyi Yenile</div>
+                              <div className="text-xs text-gray-500">Aktif kategorideki tüm konuları sıraya alır.</div>
+                          </div>
+                          <RefreshCw className="text-gray-500 group-hover:text-cf-orange" />
+                      </button>
+
+                      <button onClick={handleRegenerateAll} className="w-full flex items-center justify-between p-3 bg-[#252525] hover:bg-[#2c2c2c] rounded-lg transition-colors text-left group">
+                          <div>
+                              <div className="text-sm font-semibold text-white group-hover:text-cf-orange">Tümünü Yenile</div>
+                              <div className="text-xs text-gray-500">Tüm müfredatı AI ile yeniden oluşturur.</div>
+                          </div>
+                          <RefreshCw className="text-gray-500 group-hover:text-cf-orange" />
+                      </button>
+
+                      <hr className="border-[#333] my-2" />
+
+                      <button onClick={handleResetProgress} className="w-full flex items-center justify-between p-3 bg-[#252525] hover:bg-red-900/20 rounded-lg transition-colors text-left group">
+                          <div>
+                              <div className="text-sm font-semibold text-white group-hover:text-red-400">İlerlemeyi Sıfırla</div>
+                              <div className="text-xs text-gray-500">Okundu işaretlerini temizler.</div>
+                          </div>
+                          <Trash className="text-gray-500 group-hover:text-red-400" />
+                      </button>
+
+                      <button onClick={handleResetCache} className="w-full flex items-center justify-between p-3 bg-[#252525] hover:bg-red-900/20 rounded-lg transition-colors text-left group">
+                          <div>
+                              <div className="text-sm font-semibold text-white group-hover:text-red-400">Fabrika Ayarlarına Dön</div>
+                              <div className="text-xs text-gray-500">Tüm AI içeriklerini siler ve varsayılana döner.</div>
+                          </div>
+                          <XCircle className="text-gray-500 group-hover:text-red-400" />
+                      </button>
+                  </div>
+
+                  <button 
+                    onClick={() => setIsSettingsOpen(false)}
+                    className="mt-6 w-full py-2 bg-[#333] hover:bg-[#404040] rounded text-sm font-semibold"
+                  >
+                      Kapat
+                  </button>
+              </div>
+          </div>
+      )}
+
+      {/* Toast Notifications */}
+      <div className="fixed top-6 right-6 z-50 flex flex-col gap-3 pointer-events-none">
+        {toasts.map(toast => (
+          <div 
+            key={toast.id} 
+            className={`pointer-events-auto min-w-[300px] bg-[#161616] border-l-4 p-4 rounded shadow-2xl animate-slideLeft relative overflow-hidden
+              ${toast.type === 'success' ? 'border-green-500' : toast.type === 'error' ? 'border-red-500' : 'border-blue-500'}`}
+          >
+             <div className="flex justify-between items-start">
+                <div>
+                   <h4 className={`font-bold text-sm ${toast.type === 'success' ? 'text-green-500' : toast.type === 'error' ? 'text-red-500' : 'text-blue-500'}`}>
+                      {toast.title}
+                   </h4>
+                   <p className="text-gray-300 text-xs mt-1">{toast.message}</p>
+                </div>
+                <button onClick={() => removeToast(toast.id)} className="text-gray-500 hover:text-white">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                </button>
+             </div>
+          </div>
+        ))}
+      </div>
+
       {/* Sidebar */}
-      <div className={`${sidebarOpen ? 'w-80' : 'w-0'} transition-all duration-300 flex-shrink-0 bg-[#121212] border-r border-[#2c2c2c] flex flex-col z-10 relative`}>
+      <div className={`${sidebarOpen ? 'w-80' : 'w-0'} transition-all duration-300 flex-shrink-0 bg-[#121212] border-r border-[#2c2c2c] flex flex-col z-10 relative shadow-2xl`}>
         <div className="p-6 border-b border-[#2c2c2c] flex items-center gap-3 bg-[#121212]">
           <Logo />
-          <div>
+          <div className={`${!sidebarOpen && 'hidden'}`}>
             <h1 className="font-bold text-lg tracking-tight text-white">Cloudflare</h1>
             <span className="text-xs text-cf-orange font-bold tracking-widest uppercase">MasterClass</span>
           </div>
         </div>
 
-        {/* Global Progress */}
-        <div className="px-6 py-4 border-b border-[#2c2c2c] bg-[#161616]">
-          <div className="flex justify-between text-xs text-gray-400 mb-2">
-            <span>Genel İlerleme</span>
-            <span className="text-cf-orange font-bold">%{progressPercentage}</span>
-          </div>
-          <div className="h-1.5 bg-[#2c2c2c] rounded-full overflow-hidden">
-            <div 
-              className="h-full bg-gradient-to-r from-cf-orange to-orange-600 transition-all duration-500"
-              style={{ width: `${progressPercentage}%` }}
-            ></div>
-          </div>
+        {/* Search Box */}
+        <div className={`p-4 ${!sidebarOpen && 'hidden'}`}>
+            <div className="relative">
+                <input 
+                    type="text" 
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="Konu veya araç ara..."
+                    className="w-full bg-[#1f1f1f] border border-[#333] rounded-lg pl-9 pr-3 py-2 text-sm text-white focus:border-cf-orange focus:ring-1 focus:ring-cf-orange focus:outline-none transition-all"
+                />
+                <svg className="absolute left-3 top-2.5 text-gray-500 w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+            </div>
         </div>
 
+        {/* Status Bar for Queue */}
+        {(processingQueue.length > 0 || activeRequests.length > 0) && sidebarOpen && (
+            <div className="px-4 py-2 bg-[#1a1a1a] border-y border-[#2c2c2c] flex items-center justify-between text-xs">
+               <div className="flex items-center gap-2">
+                   <div className="flex gap-1">
+                     <div className="w-1.5 h-1.5 bg-cf-orange rounded-full animate-pulse"></div>
+                   </div>
+                   <span className="text-gray-400">İşleniyor: <span className="text-cf-orange font-bold">{activeRequests.length}</span> / Sırada: <span className="text-white font-bold">{processingQueue.length}</span></span>
+               </div>
+               <button 
+                 onClick={handleClearQueue} 
+                 className="text-red-400 hover:text-red-300 hover:bg-red-900/20 rounded p-1"
+                 title="Sırayı Temizle"
+               >
+                   <XCircle />
+               </button>
+            </div>
+        )}
+
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
-          {CLOUDFLARE_CURRICULUM.map((category) => (
+          {filteredCurriculum.map((category) => (
             <div key={category.id} className="mb-2">
               <div 
                 className={`flex items-center gap-3 text-sm px-3 py-2 rounded-lg cursor-pointer transition-colors ${activeCategory === category.id ? 'text-white bg-[#2c2c2c]' : 'text-gray-400 hover:text-white hover:bg-[#1f1f1f]'}`}
@@ -147,15 +398,21 @@ const App: React.FC = () => {
                 <span className={`${activeCategory === category.id ? 'text-cf-orange' : 'text-gray-500'}`}>
                    {getCategoryIcon(category.id)}
                 </span>
-                <span className="font-bold uppercase tracking-wide text-xs flex-1">{category.title}</span>
-                <ChevronRight />
+                <span className={`font-bold uppercase tracking-wide text-xs flex-1 ${!sidebarOpen && 'hidden'}`}>{category.title}</span>
+                {sidebarOpen && <ChevronRight />}
               </div>
               
-              {activeCategory === category.id && (
-                <div className="mt-2 space-y-1 ml-4 border-l border-[#2c2c2c] pl-2">
+              {activeCategory === category.id && sidebarOpen && (
+                <div className="mt-2 space-y-1 ml-4 border-l border-[#2c2c2c] pl-2 animate-fadeIn">
                   {category.topics.map((topic) => {
                     const isCompleted = completedTopics.includes(topic.id);
                     const isActive = activeTopic?.id === topic.id;
+                    const isProcessing = isTopicProcessing(topic.id);
+                    const isQueued = isTopicQueued(topic.id);
+                    // Check if content is different from static
+                    const isCustom = contentCache[topic.id] && contentCache[topic.id].content !== STATIC_TUTORIALS[topic.id]?.content;
+                    const isCached = !!contentCache[topic.id];
+
                     return (
                       <button
                         key={topic.id}
@@ -165,8 +422,22 @@ const App: React.FC = () => {
                             ? 'bg-[#F38020]/10 text-[#F38020] border-r-2 border-[#F38020]' 
                             : 'text-gray-400 hover:bg-[#1f1f1f] hover:text-white'}`}
                       >
-                        <div className={`mt-1 w-2 h-2 rounded-full flex-shrink-0 ${isCompleted ? 'bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.5)]' : 'bg-[#363636]'}`}></div>
-                        <div className="flex-1 min-w-0">
+                         {/* Status Icon */}
+                        <div className="mt-1 flex-shrink-0">
+                           {isProcessing ? (
+                               <div className="w-2 h-2 rounded-full border border-cf-orange border-t-transparent animate-spin"></div>
+                           ) : isQueued ? (
+                               <div className="w-2 h-2 rounded-full bg-gray-600 animate-pulse"></div>
+                           ) : (
+                                <div className={`w-2 h-2 rounded-full transition-colors duration-300
+                                    ${isCompleted ? 'bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.5)]' : 
+                                    (isCached && isCustom) ? 'bg-purple-500 shadow-[0_0_5px_rgba(168,85,247,0.5)]' :
+                                    isCached ? 'bg-blue-500/50' : 'bg-[#363636]'}`}>
+                                </div>
+                           )}
+                        </div>
+
+                        <div className="flex-1 min-w-0 flex justify-between items-center">
                           <div className={`font-medium truncate ${isCompleted && !isActive ? 'line-through opacity-50' : ''}`}>{topic.title}</div>
                         </div>
                       </button>
@@ -176,6 +447,20 @@ const App: React.FC = () => {
               )}
             </div>
           ))}
+          {filteredCurriculum.length === 0 && (
+              <div className="text-center text-gray-500 text-sm mt-4">Sonuç bulunamadı</div>
+          )}
+        </div>
+
+        {/* Settings Button */}
+        <div className="p-4 border-t border-[#2c2c2c] bg-[#121212]">
+            <button 
+                onClick={() => setIsSettingsOpen(true)}
+                className={`flex items-center gap-3 w-full px-3 py-2 text-sm text-gray-400 hover:text-white hover:bg-[#1f1f1f] rounded-lg transition-colors ${!sidebarOpen && 'justify-center'}`}
+            >
+                <Settings />
+                {sidebarOpen && <span>Ayarlar & Araçlar</span>}
+            </button>
         </div>
       </div>
 
@@ -189,27 +474,38 @@ const App: React.FC = () => {
                <svg width="24" height="24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
             </button>
             {activeTopic && (
-               <div className="flex flex-col">
+               <div className="flex flex-col animate-fadeIn">
                   <span className="text-xs text-gray-500 font-mono uppercase">Şu an inceleniyor</span>
-                  <span className="text-sm font-bold text-white truncate max-w-[300px]">{activeTopic.title}</span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-bold text-white truncate max-w-[300px]">{activeTopic.title}</span>
+                    {(isTopicProcessing(activeTopic.id) || isTopicQueued(activeTopic.id)) && (
+                        <span className="text-xs text-cf-orange animate-pulse border border-cf-orange/50 px-1 rounded">
+                            {isTopicProcessing(activeTopic.id) ? 'YENİLENİYOR...' : 'SIRADA...'}
+                        </span>
+                    )}
+                  </div>
                </div>
             )}
           </div>
           
           <div className="flex items-center gap-3">
-             {content && !loading && (
+             {activeContent && (
                 <>
+                   <button 
+                    onClick={() => activeTopic && handleRegenerate(activeTopic)}
+                    disabled={activeTopic && (isTopicProcessing(activeTopic.id) || isTopicQueued(activeTopic.id))}
+                    className="flex items-center gap-2 px-3 py-2 text-xs font-bold text-gray-400 hover:text-white hover:bg-[#2c2c2c] rounded transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                    title="İçeriği Yapay Zeka ile Yeniden Oluştur"
+                  >
+                    <svg className={`${activeTopic && isTopicProcessing(activeTopic.id) ? 'animate-spin' : ''}`} width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M23 4v6h-6"></path><path d="M1 20v-6h6"></path><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+                    {activeTopic && isTopicProcessing(activeTopic.id) ? 'İŞLENİYOR' : 'YENİLE'}
+                  </button>
                   <button 
                     onClick={downloadPDF}
                     disabled={isPdfGenerating}
                     className="flex items-center gap-2 px-4 py-2 text-xs font-bold text-gray-300 bg-[#1f1f1f] border border-[#363636] rounded hover:bg-[#2c2c2c] transition-all"
                   >
-                    {isPdfGenerating ? 'Hazırlanıyor...' : (
-                        <>
-                           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
-                           PDF İNDİR
-                        </>
-                    )}
+                    {isPdfGenerating ? '...' : 'PDF İNDİR'}
                   </button>
                   <button 
                     onClick={() => activeTopic && toggleComplete(activeTopic.id)}
@@ -228,52 +524,61 @@ const App: React.FC = () => {
         {/* Scrollable Content Area */}
         <div className="flex-1 overflow-y-auto relative">
           
-          {!activeTopic && !loading && (
-             <div className="flex flex-col items-center justify-center h-full p-8 text-center">
+          {!activeTopic && (
+             <div className="flex flex-col items-center justify-center h-full p-8 text-center animate-fadeIn">
                 <div className="w-24 h-24 bg-[#1a1a1a] rounded-2xl flex items-center justify-center mb-8 border border-[#333] shadow-[0_0_30px_rgba(243,128,32,0.1)]">
                   <Logo />
                 </div>
                 <h2 className="text-5xl font-extrabold text-white mb-6 tracking-tight">Cloudflare <span className="text-cf-orange">MasterClass</span></h2>
                 <p className="text-gray-400 text-lg mb-10 max-w-2xl leading-relaxed">
                   İnternet altyapısının geleceğini şekillendiren teknolojileri öğrenin. 
-                  Zero Trust'tan Serverless mimarilere kadar eksiksiz ve derinlemesine bir yolculuk.
                 </p>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 max-w-4xl w-full text-left">
-                  {[
-                    { title: "Network & Security", desc: "DNS, DDoS, WAF ve tünelleme.", icon: <Shield /> },
-                    { title: "Serverless Compute", desc: "Workers, Pages ve Durable Objects.", icon: <Terminal /> },
-                    { title: "Data & AI", desc: "R2, D1 SQL ve Workers AI.", icon: <Database /> }
-                  ].map((item, i) => (
-                    <div key={i} className="bg-[#161616] p-6 rounded-xl border border-[#2c2c2c] hover:border-cf-orange/50 transition-colors group">
-                       <div className="text-cf-orange mb-4 p-3 bg-cf-orange/10 w-fit rounded-lg group-hover:scale-110 transition-transform">{item.icon}</div>
-                       <h3 className="text-white font-bold mb-2">{item.title}</h3>
-                       <p className="text-sm text-gray-400">{item.desc}</p>
-                    </div>
-                  ))}
+                
+                {/* Search Recommendation Chips */}
+                <div className="flex flex-wrap justify-center gap-2 mb-8 max-w-2xl">
+                    {['Workers', 'WAF Kuralları', 'DDoS', 'R2 Storage', 'Terraform', 'Zero Trust'].map(tag => (
+                        <button 
+                            key={tag}
+                            onClick={() => setSearchQuery(tag)}
+                            className="text-xs bg-[#1f1f1f] border border-[#2c2c2c] text-gray-400 px-3 py-1 rounded-full hover:border-cf-orange hover:text-cf-orange transition-colors"
+                        >
+                            {tag}
+                        </button>
+                    ))}
                 </div>
              </div>
           )}
 
-          {loading && (
-            <div className="max-w-4xl mx-auto p-12 space-y-8">
-              <div className="flex items-center gap-4 mb-8">
-                 <div className="w-12 h-12 rounded-full border-2 border-cf-orange border-t-transparent animate-spin"></div>
-                 <span className="text-xl font-mono text-cf-orange animate-pulse">Eğitim İçeriği Oluşturuluyor...</span>
+          {/* Loading State: If no content AND (processing OR queued) */}
+          {activeTopic && !activeContent && (isTopicProcessing(activeTopic.id) || isTopicQueued(activeTopic.id)) && (
+            <div className="max-w-4xl mx-auto p-12 space-y-8 animate-fadeIn flex flex-col items-center justify-center h-full">
+              <div className="relative">
+                  <div className="w-16 h-16 rounded-full border-4 border-[#333] border-t-cf-orange animate-spin"></div>
+                  <div className="absolute inset-0 flex items-center justify-center font-bold text-xs text-white">
+                      {isTopicProcessing(activeTopic.id) ? 'AI' : 'Q'}
+                  </div>
               </div>
-              <div className="space-y-4">
-                <div className="h-4 bg-[#1f1f1f] rounded w-full animate-pulse"></div>
-                <div className="h-4 bg-[#1f1f1f] rounded w-11/12 animate-pulse"></div>
-                <div className="h-4 bg-[#1f1f1f] rounded w-4/5 animate-pulse"></div>
-              </div>
-              <div className="grid grid-cols-2 gap-4 mt-8">
-                  <div className="h-40 bg-[#1f1f1f] rounded border border-[#2c2c2c] animate-pulse"></div>
-                  <div className="h-40 bg-[#1f1f1f] rounded border border-[#2c2c2c] animate-pulse"></div>
+              <div className="text-center">
+                  <span className="text-xl font-mono text-cf-orange block mb-2">
+                    {isTopicProcessing(activeTopic.id) ? 'İçerik Hazırlanıyor...' : 'Sırada Bekliyor...'}
+                  </span>
+                  <p className="text-gray-500 text-sm max-w-md">
+                    Cloudflare AI modelleri sizin için en güncel bilgileri derliyor. Bu sırada diğer konulara göz atabilirsiniz.
+                  </p>
               </div>
             </div>
           )}
 
-          {!loading && content && (
-            <div className="p-8 md:p-12 pb-32">
+          {activeContent && (
+            <div className="p-8 md:p-12 pb-32 animate-slideUp">
+              {/* If regenerating in background, show overlay hint */}
+              {(isTopicProcessing(activeTopic!.id) || isTopicQueued(activeTopic!.id)) && (
+                  <div className="bg-cf-orange/10 border border-cf-orange/20 text-cf-orange p-3 rounded-lg mb-6 text-sm flex items-center gap-3 animate-pulse">
+                      <div className="w-2 h-2 bg-cf-orange rounded-full"></div>
+                      Arka planda daha yeni bir versiyon hazırlanıyor...
+                  </div>
+              )}
+
               <div id="tutorial-content" className="max-w-4xl mx-auto bg-[#161616] p-10 rounded-2xl border border-[#2c2c2c] shadow-2xl relative pdf-content">
                  
                  <div className="absolute top-0 right-0 p-6 opacity-20">
@@ -287,77 +592,33 @@ const App: React.FC = () => {
                         'bg-blue-900/30 text-blue-400 border border-blue-800'}`}>
                       {activeTopic?.level}
                     </span>
-                    <span className="text-gray-500 text-sm">/</span>
-                    <span className="text-gray-400 text-sm font-medium">{activeCategory?.toUpperCase()}</span>
                  </div>
 
                 <h1 className="text-4xl md:text-5xl font-bold text-white mb-8 pb-6 border-b border-[#2c2c2c] leading-tight">
-                  {content.title}
+                  {activeContent.title}
                 </h1>
                 
                 <div className="prose prose-invert prose-headings:text-white prose-p:text-gray-300 prose-code:text-cf-orange max-w-none">
-                   <MarkdownRenderer content={content.content} />
+                   <MarkdownRenderer content={activeContent.content} />
                 </div>
 
                 <div className="mt-12 pt-8 border-t border-[#2c2c2c] flex justify-between items-end text-gray-500 text-xs font-mono">
                    <div>Generated by Cloudflare MasterClass AI</div>
-                   <div>{new Date().toLocaleDateString('tr-TR')}</div>
                 </div>
-              </div>
-
-              {/* Research / Deep Dive Section */}
-              <div className="max-w-4xl mx-auto mt-12 bg-gradient-to-r from-[#1D1D1D] to-[#161616] border border-cf-orange/20 rounded-xl p-8 relative overflow-hidden group hover:border-cf-orange/40 transition-colors">
-                <div className="absolute -right-10 -top-10 w-40 h-40 bg-cf-orange/10 rounded-full blur-3xl group-hover:bg-cf-orange/20 transition-all"></div>
-                
-                <h3 className="text-2xl font-bold text-white mb-3 flex items-center gap-3">
-                  <Sparkles className="text-cf-orange" />
-                  Uzmanına Sor
-                </h3>
-                <p className="text-gray-400 mb-6 max-w-2xl">
-                  Bu konu hakkında spesifik bir senaryonuz mu var? Veya "Edge Case" bir durumu merak mı ediyorsunuz? 
-                  Yapay zeka asistanı sizin için teknik analiz yapsın.
-                </p>
-                
-                <div className="flex gap-3 mb-6">
-                  <input 
-                    type="text" 
-                    value={deepDiveQuery}
-                    onChange={(e) => setDeepDiveQuery(e.target.value)}
-                    placeholder="Örn: Bu yapıyı 10 milyon istek alan bir e-ticaret sitesi için nasıl ölçeklerim?"
-                    className="flex-1 bg-black/40 border border-[#363636] rounded-lg px-5 py-3 text-white placeholder-gray-600 focus:outline-none focus:border-cf-orange focus:ring-1 focus:ring-cf-orange transition-all"
-                    onKeyDown={(e) => e.key === 'Enter' && handleDeepDive()}
-                  />
-                  <button 
-                    onClick={handleDeepDive}
-                    disabled={!deepDiveQuery}
-                    className="bg-cf-orange hover:bg-orange-600 disabled:opacity-50 text-white font-bold px-8 py-3 rounded-lg transition-transform active:scale-95 shadow-lg shadow-orange-900/20"
-                  >
-                    ANALİZ ET
-                  </button>
-                </div>
-
-                {content.relatedTopics && content.relatedTopics.length > 0 && (
-                  <div className="flex flex-wrap gap-2">
-                    {content.relatedTopics.map((tag, idx) => (
-                      <button 
-                        key={idx} 
-                        onClick={() => {
-                          setDeepDiveQuery(tag);
-                          handleDeepDive(); // Optional: Auto trigger or just fill
-                        }}
-                        className="text-xs font-mono bg-[#2c2c2c] hover:bg-[#363636] hover:text-cf-orange text-gray-400 px-3 py-1.5 rounded border border-[#363636] transition-colors"
-                      >
-                        {tag}
-                      </button>
-                    ))}
-                  </div>
-                )}
               </div>
 
             </div>
           )}
         </div>
       </div>
+      
+      {/* AI Chat Bubble */}
+      <ChatBubble 
+        messages={chatMessages}
+        onSendMessage={handleChat}
+        isLoading={isChatLoading}
+      />
+
     </div>
   );
 };

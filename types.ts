@@ -25,6 +25,10 @@ export interface GeneratedContent {
 }
 
 export interface ChatMessage {
+  id: string;
   role: 'user' | 'model';
   text: string;
+  isThinking?: boolean;
 }
+
+export type ContentCache = Record<string, GeneratedContent>;
