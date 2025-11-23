@@ -1,31 +1,36 @@
+
 import { GoogleGenAI, Type } from "@google/genai";
-import { GeneratedContent, ChatMessage } from '../types';
+import { GeneratedContent, ChatMessage, Language } from '../types';
 
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-const INSTRUCTOR_PERSONA = `
-Sen Cloudflare MasterClass Eğitmenisin.
-Tarzın: Profesyonel, teknik derinliği yüksek ama anlaşılır.
-Kullanıcı bir öğrenci veya sistem yöneticisi olabilir.
-Yanıtların kısa, öz ve çözüm odaklı olmalı. Markdown kullanabilirsin.
+const INSTRUCTOR_PERSONA = (lang: Language) => `
+You are a Cloudflare MasterClass Instructor.
+Language: ${lang === 'tr' ? 'Turkish (Türkçe)' : 'English'}
+Style: Professional, high technical depth but understandable.
+Target Audience: Students or System Administrators.
+Responses: Concise, solution-oriented. Use Markdown.
 `;
 
-const CONTENT_GENERATION_INSTRUCTION = `
-${INSTRUCTOR_PERSONA}
-Görevin: Kullanıcıya Cloudflare konusunu eksiksiz bir "Dokümantasyon/Tutorial" formatında sunmak.
+const CONTENT_GENERATION_INSTRUCTION = (lang: Language) => `
+${INSTRUCTOR_PERSONA(lang)}
+Task: Provide a comprehensive "Documentation/Tutorial" for the Cloudflare topic provided.
 Format:
-1. Başlık ve Özet
-2. Teknik Mimari (Derinlemesine)
-3. Konfigürasyon / Kod Örnekleri
-4. Pro Tip (Sadece uzmanların bildiği)
+1. Title and Executive Summary
+2. Technical Architecture (Deep Dive)
+3. Configuration / Code Examples
+4. Pro Tip (Only known by experts)
+
+Ensure the output is strictly in ${lang === 'tr' ? 'Turkish' : 'English'}.
 `;
 
-export const generateTutorialContent = async (topicTitle: string, level: string): Promise<GeneratedContent> => {
+export const generateTutorialContent = async (topicTitle: string, level: string, lang: Language): Promise<GeneratedContent> => {
   const prompt = `
-  KONU: ${topicTitle}
-  SEVİYE: ${level}
+  TOPIC: ${topicTitle}
+  LEVEL: ${level}
+  LANGUAGE: ${lang === 'tr' ? 'Turkish' : 'English'}
 
-  Lütfen bu konu için Markdown formatında kapsamlı bir eğitim içeriği oluştur.
+  Please create comprehensive training content in Markdown format for this topic.
   `;
 
   try {
@@ -33,7 +38,7 @@ export const generateTutorialContent = async (topicTitle: string, level: string)
       model: "gemini-2.5-flash",
       contents: prompt,
       config: {
-        systemInstruction: CONTENT_GENERATION_INSTRUCTION,
+        systemInstruction: CONTENT_GENERATION_INSTRUCTION(lang),
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
@@ -53,13 +58,19 @@ export const generateTutorialContent = async (topicTitle: string, level: string)
     const text = response.text;
     if (!text) throw new Error("No response from AI");
     
-    return JSON.parse(text) as GeneratedContent;
+    const parsed = JSON.parse(text);
+    return {
+        ...parsed,
+        language: lang
+    } as GeneratedContent;
+
   } catch (error) {
     console.error("Gemini API Error:", error);
     return {
-      title: "Hata",
-      content: "İçerik oluşturulurken bir hata meydana geldi.",
-      relatedTopics: []
+      title: lang === 'tr' ? "Hata" : "Error",
+      content: lang === 'tr' ? "İçerik oluşturulurken bir hata meydana geldi." : "An error occurred while generating content.",
+      relatedTopics: [],
+      language: lang
     };
   }
 };
@@ -67,7 +78,8 @@ export const generateTutorialContent = async (topicTitle: string, level: string)
 export const chatWithContext = async (
   message: string, 
   currentContext: string | null, 
-  history: ChatMessage[]
+  history: ChatMessage[],
+  lang: Language
 ): Promise<string> => {
   
   const historyParts = history.map(h => ({
@@ -76,35 +88,23 @@ export const chatWithContext = async (
   }));
 
   const contextPrompt = currentContext 
-    ? `KULLANICININ ŞU AN OKUDUĞU İÇERİK:\n${currentContext.substring(0, 3000)}...\n\n` 
+    ? `USER CURRENTLY READING:\n${currentContext.substring(0, 3000)}...\n\n` 
     : "";
 
-  const finalPrompt = `${contextPrompt}KULLANICI SORUSU: ${message}`;
+  const finalPrompt = `${contextPrompt}USER QUESTION: ${message}`;
 
   try {
     const chat = ai.chats.create({
       model: "gemini-2.5-flash",
       config: {
-        systemInstruction: INSTRUCTOR_PERSONA + " Kısa ve net cevaplar ver. Eğer bir kod bloğu seçildiyse onu açıkla.",
+        systemInstruction: INSTRUCTOR_PERSONA(lang) + (lang === 'tr' ? " Kısa ve net cevaplar ver." : " Give short and clear answers."),
       },
       history: historyParts
     });
 
     const result = await chat.sendMessage({ message: finalPrompt });
-    return result.text || "Cevap alınamadı.";
+    return result.text || (lang === 'tr' ? "Cevap alınamadı." : "No response received.");
   } catch (error) {
-    return "Üzgünüm, şu an bağlantı kuramıyorum.";
+    return lang === 'tr' ? "Üzgünüm, şu an bağlantı kuramıyorum." : "Sorry, I cannot connect right now.";
   }
-};
-
-// Legacy Deep Dive wrapper (can be repurposed or removed, kept for compatibility)
-export const generateDeepDive = async (currentContext: string, specificQuery: string): Promise<GeneratedContent> => {
-    // This is now effectively handled by the chat, but we keep the structure for "GeneratedContent" type return if needed
-    // or simply reuse the chat logic. For now, let's keep it distinct as a "Full Page Analysis".
-    const responseText = await chatWithContext(specificQuery, currentContext, []);
-    return {
-        title: "Analiz Sonucu",
-        content: responseText,
-        relatedTopics: []
-    };
 };

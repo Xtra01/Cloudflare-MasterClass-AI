@@ -1,7 +1,9 @@
+
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { CLOUDFLARE_CURRICULUM, STATIC_TUTORIALS } from './constants';
-import { Topic, ChatMessage, ContentCache } from './types';
+import { Topic, ChatMessage, ContentCache, Language } from './types';
 import { generateTutorialContent, chatWithContext } from './services/geminiService';
+import { UI_TEXT } from './translations';
 import MarkdownRenderer from './components/MarkdownRenderer';
 import ChatBubble from './components/ChatBubble';
 import { Logo, ChevronRight, BookOpen, Terminal, Shield, Zap, Database, Lock, Sparkles, Settings, RefreshCw, XCircle, Trash } from './components/Icons';
@@ -23,6 +25,7 @@ interface ToastNotification {
 }
 
 const App: React.FC = () => {
+  const [language, setLanguage] = useState<Language>('tr');
   const [activeCategory, setActiveCategory] = useState<string | null>(CLOUDFLARE_CURRICULUM[0].id);
   const [activeTopic, setActiveTopic] = useState<Topic | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -30,12 +33,12 @@ const App: React.FC = () => {
   const [isPdfGenerating, setIsPdfGenerating] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   
-  // Caching State
+  // Caching State: TopicID -> { tr: Content, en: Content }
   const [contentCache, setContentCache] = useState<ContentCache>(STATIC_TUTORIALS);
   
   // Queue System State
   const [processingQueue, setProcessingQueue] = useState<Topic[]>([]);
-  const [activeRequests, setActiveRequests] = useState<string[]>([]); // Array of Topic IDs currently fetching
+  const [activeRequests, setActiveRequests] = useState<string[]>([]); 
   
   // Search State
   const [searchQuery, setSearchQuery] = useState('');
@@ -47,6 +50,9 @@ const App: React.FC = () => {
   // Notifications
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
 
+  // Text Dictionary
+  const T = UI_TEXT[language];
+
   useEffect(() => {
     const saved = localStorage.getItem('cf_masterclass_progress');
     if (saved) {
@@ -54,48 +60,47 @@ const App: React.FC = () => {
     }
   }, []);
 
-  // Queue Processor
+  // Process Queue
   useEffect(() => {
     const processQueue = async () => {
       if (processingQueue.length === 0 || activeRequests.length >= MAX_CONCURRENT_REQUESTS) {
         return;
       }
 
-      // Get next item from queue
       const [nextTopic, ...remainingQueue] = processingQueue;
       
-      // Update states immediately to prevent double processing
       setProcessingQueue(remainingQueue);
       setActiveRequests(prev => [...prev, nextTopic.id]);
 
       try {
-        const result = await generateTutorialContent(nextTopic.title, nextTopic.level);
+        // Generate content for the CURRENT language
+        const result = await generateTutorialContent(nextTopic.title[language], nextTopic.level, language);
         
-        // Update Cache
         setContentCache(prev => ({
             ...prev,
-            [nextTopic.id]: result
+            [nextTopic.id]: {
+                ...prev[nextTopic.id],
+                [language]: result
+            }
         }));
 
-        addToast(nextTopic.id, "İçerik Hazır", `${nextTopic.title} başarıyla oluşturuldu.`, 'success');
+        addToast(nextTopic.id, T.toastReady, `${nextTopic.title[language]} ${T.toastReadyDesc}`, 'success');
 
       } catch (e) {
         console.error(e);
-        addToast(nextTopic.id, "Hata", `${nextTopic.title} oluşturulamadı.`, 'error');
+        addToast(nextTopic.id, T.toastError, `${nextTopic.title[language]} ${T.toastErrorDesc}`, 'error');
       } finally {
-        // Remove from active requests
         setActiveRequests(prev => prev.filter(id => id !== nextTopic.id));
       }
     };
 
     processQueue();
-  }, [processingQueue, activeRequests]);
+  }, [processingQueue, activeRequests, language]);
 
   const addToast = (id: string, title: string, message: string, type: 'success' | 'info' | 'error') => {
     const toastId = Date.now().toString() + Math.random();
     setToasts(prev => [...prev, { id: toastId, title, message, type }]);
     
-    // Auto remove after 5 seconds
     setTimeout(() => {
       setToasts(prev => prev.filter(t => t.id !== toastId));
     }, 5000);
@@ -116,20 +121,20 @@ const App: React.FC = () => {
     localStorage.setItem('cf_masterclass_progress', JSON.stringify(newCompleted));
   };
 
-  // Main interaction handler
   const handleTopicClick = (topic: Topic) => {
     setActiveTopic(topic);
     
-    // If content exists, we are good. 
-    // If not, and it's not already in queue/processing, add it.
-    if (!contentCache[topic.id] && !isTopicProcessing(topic.id) && !isTopicQueued(topic.id)) {
+    // Check if content exists for current language
+    const hasContent = contentCache[topic.id] && contentCache[topic.id][language];
+
+    if (!hasContent && !isTopicProcessing(topic.id) && !isTopicQueued(topic.id)) {
         addToQueue(topic);
     }
   };
 
   const handleRegenerate = (topic: Topic) => {
     addToQueue(topic);
-    addToast(topic.id, "Sıraya Alındı", `${topic.title} güncellenmek üzere sıraya eklendi.`, 'info');
+    addToast(topic.id, T.toastQueued, `${topic.title[language]} ${T.toastQueuedDesc}`, 'info');
   };
 
   const addToQueue = (topic: Topic) => {
@@ -137,7 +142,6 @@ const App: React.FC = () => {
     setProcessingQueue(prev => [...prev, topic]);
   };
 
-  // Bulk Actions
   const handleRegenerateCategory = () => {
     if (!activeCategory) return;
     const cat = CLOUDFLARE_CURRICULUM.find(c => c.id === activeCategory);
@@ -154,7 +158,7 @@ const App: React.FC = () => {
 
     if (addedCount > 0) {
         setProcessingQueue(prev => [...prev, ...newItems]);
-        addToast("bulk-cat", "Kategori Güncelleniyor", `${addedCount} konu sıraya eklendi.`, "info");
+        addToast("bulk-cat", T.toastBulkCat, `${addedCount} ${T.toastBulkCatDesc}`, "info");
     }
     setIsSettingsOpen(false);
   };
@@ -169,32 +173,28 @@ const App: React.FC = () => {
 
     if (newItems.length > 0) {
         setProcessingQueue(prev => [...prev, ...newItems]);
-        addToast("bulk-all", "Tam Yenileme Başlatıldı", `${newItems.length} konu sıraya alındı. Bu işlem zaman alabilir.`, "info");
-    } else {
-        addToast("bulk-all-empty", "Sıra Dolu", "Tüm konular zaten sırada veya işleniyor.", "info");
+        addToast("bulk-all", T.toastBulkAll, `${newItems.length} ${T.toastBulkAllDesc}`, "info");
     }
     setIsSettingsOpen(false);
   };
 
   const handleResetCache = () => {
-      // Clear queue first
       setProcessingQueue([]);
-      // Revert to static
       setContentCache(STATIC_TUTORIALS);
-      addToast("reset", "Fabrika Ayarlarına Dönüldü", "Tüm içerikler varsayılan (hızlı) haline getirildi.", "success");
+      addToast("reset", T.toastReset, T.toastResetDesc, "success");
       setIsSettingsOpen(false);
   };
 
   const handleResetProgress = () => {
       setCompletedTopics([]);
       localStorage.removeItem('cf_masterclass_progress');
-      addToast("reset-prog", "İlerleme Sıfırlandı", "Okundu işaretleri kaldırıldı.", "success");
+      addToast("reset-prog", T.toastResetProg, T.resetProgressDesc, "success");
       setIsSettingsOpen(false);
   };
 
   const handleClearQueue = () => {
       setProcessingQueue([]);
-      addToast("clear-queue", "Kuyruk Temizlendi", "Bekleyen işlemler iptal edildi.", "info");
+      addToast("clear-queue", T.toastQueueCleared, "", "info");
   };
 
   const isTopicProcessing = (id: string) => activeRequests.includes(id);
@@ -205,10 +205,10 @@ const App: React.FC = () => {
     setChatMessages(prev => [...prev, newUserMsg]);
     setIsChatLoading(true);
 
-    const currentContentText = activeTopic ? contentCache[activeTopic.id]?.content : null;
+    const currentContentText = activeTopic ? contentCache[activeTopic.id]?.[language]?.content : null;
 
     try {
-        const responseText = await chatWithContext(text, currentContentText, [...chatMessages, newUserMsg]);
+        const responseText = await chatWithContext(text, currentContentText, [...chatMessages, newUserMsg], language);
         const newModelMsg: ChatMessage = { id: (Date.now() + 1).toString(), role: 'model', text: responseText };
         setChatMessages(prev => [...prev, newModelMsg]);
     } finally {
@@ -217,13 +217,13 @@ const App: React.FC = () => {
   };
 
   const downloadPDF = () => {
-    if (!activeTopic || !contentCache[activeTopic.id] || !window.html2pdf) return;
+    if (!activeTopic || !contentCache[activeTopic.id]?.[language] || !window.html2pdf) return;
     setIsPdfGenerating(true);
     
     const element = document.getElementById('tutorial-content');
     const opt = {
       margin: 10,
-      filename: `CF-MasterClass-${activeTopic?.id}.pdf`,
+      filename: `CF-MasterClass-${activeTopic?.id}-${language}.pdf`,
       image: { type: 'jpeg', quality: 0.98 },
       html2canvas: { scale: 2, useCORS: true, backgroundColor: '#1a1a1a' },
       jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
@@ -246,7 +246,6 @@ const App: React.FC = () => {
     }
   };
 
-  // Filtered Navigation based on search
   const filteredCurriculum = useMemo(() => {
     if (!searchQuery) return CLOUDFLARE_CURRICULUM;
     const lowerQ = searchQuery.toLowerCase();
@@ -254,13 +253,14 @@ const App: React.FC = () => {
     return CLOUDFLARE_CURRICULUM.map(cat => ({
         ...cat,
         topics: cat.topics.filter(t => 
-            t.title.toLowerCase().includes(lowerQ) || 
-            t.description.toLowerCase().includes(lowerQ)
+            t.title[language].toLowerCase().includes(lowerQ) || 
+            t.description[language].toLowerCase().includes(lowerQ)
         )
     })).filter(cat => cat.topics.length > 0);
-  }, [searchQuery]);
+  }, [searchQuery, language]);
 
-  const activeContent = activeTopic ? contentCache[activeTopic.id] : null;
+  // Get active content safely
+  const activeContent = activeTopic ? contentCache[activeTopic.id]?.[language] : null;
 
   return (
     <div className="flex h-screen bg-[#0d0d0d] text-gray-100 overflow-hidden font-sans relative">
@@ -273,22 +273,22 @@ const App: React.FC = () => {
           <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm animate-fadeIn" onClick={() => setIsSettingsOpen(false)}>
               <div className="bg-[#1a1a1a] border border-[#333] rounded-xl p-6 w-[400px] shadow-2xl relative" onClick={e => e.stopPropagation()}>
                   <h3 className="text-xl font-bold text-white mb-6 flex items-center gap-2">
-                      <Settings /> Ayarlar & Araçlar
+                      <Settings /> {T.settingsTitle}
                   </h3>
                   
                   <div className="space-y-3">
                       <button onClick={handleRegenerateCategory} className="w-full flex items-center justify-between p-3 bg-[#252525] hover:bg-[#2c2c2c] rounded-lg transition-colors text-left group">
                           <div>
-                              <div className="text-sm font-semibold text-white group-hover:text-cf-orange">Kategoriyi Yenile</div>
-                              <div className="text-xs text-gray-500">Aktif kategorideki tüm konuları sıraya alır.</div>
+                              <div className="text-sm font-semibold text-white group-hover:text-cf-orange">{T.refreshCategory}</div>
+                              <div className="text-xs text-gray-500">{T.refreshCategoryDesc}</div>
                           </div>
                           <RefreshCw className="text-gray-500 group-hover:text-cf-orange" />
                       </button>
 
                       <button onClick={handleRegenerateAll} className="w-full flex items-center justify-between p-3 bg-[#252525] hover:bg-[#2c2c2c] rounded-lg transition-colors text-left group">
                           <div>
-                              <div className="text-sm font-semibold text-white group-hover:text-cf-orange">Tümünü Yenile</div>
-                              <div className="text-xs text-gray-500">Tüm müfredatı AI ile yeniden oluşturur.</div>
+                              <div className="text-sm font-semibold text-white group-hover:text-cf-orange">{T.refreshAll}</div>
+                              <div className="text-xs text-gray-500">{T.refreshAllDesc}</div>
                           </div>
                           <RefreshCw className="text-gray-500 group-hover:text-cf-orange" />
                       </button>
@@ -297,16 +297,16 @@ const App: React.FC = () => {
 
                       <button onClick={handleResetProgress} className="w-full flex items-center justify-between p-3 bg-[#252525] hover:bg-red-900/20 rounded-lg transition-colors text-left group">
                           <div>
-                              <div className="text-sm font-semibold text-white group-hover:text-red-400">İlerlemeyi Sıfırla</div>
-                              <div className="text-xs text-gray-500">Okundu işaretlerini temizler.</div>
+                              <div className="text-sm font-semibold text-white group-hover:text-red-400">{T.resetProgress}</div>
+                              <div className="text-xs text-gray-500">{T.resetProgressDesc}</div>
                           </div>
                           <Trash className="text-gray-500 group-hover:text-red-400" />
                       </button>
 
                       <button onClick={handleResetCache} className="w-full flex items-center justify-between p-3 bg-[#252525] hover:bg-red-900/20 rounded-lg transition-colors text-left group">
                           <div>
-                              <div className="text-sm font-semibold text-white group-hover:text-red-400">Fabrika Ayarlarına Dön</div>
-                              <div className="text-xs text-gray-500">Tüm AI içeriklerini siler ve varsayılana döner.</div>
+                              <div className="text-sm font-semibold text-white group-hover:text-red-400">{T.factoryReset}</div>
+                              <div className="text-xs text-gray-500">{T.factoryResetDesc}</div>
                           </div>
                           <XCircle className="text-gray-500 group-hover:text-red-400" />
                       </button>
@@ -316,7 +316,7 @@ const App: React.FC = () => {
                     onClick={() => setIsSettingsOpen(false)}
                     className="mt-6 w-full py-2 bg-[#333] hover:bg-[#404040] rounded text-sm font-semibold"
                   >
-                      Kapat
+                      {T.settingsClose}
                   </button>
               </div>
           </div>
@@ -347,13 +347,35 @@ const App: React.FC = () => {
 
       {/* Sidebar */}
       <div className={`${sidebarOpen ? 'w-80' : 'w-0'} transition-all duration-300 flex-shrink-0 bg-[#121212] border-r border-[#2c2c2c] flex flex-col z-10 relative shadow-2xl`}>
-        <div className="p-6 border-b border-[#2c2c2c] flex items-center gap-3 bg-[#121212]">
-          <Logo />
-          <div className={`${!sidebarOpen && 'hidden'}`}>
-            <h1 className="font-bold text-lg tracking-tight text-white">Cloudflare</h1>
-            <span className="text-xs text-cf-orange font-bold tracking-widest uppercase">MasterClass</span>
-          </div>
+        <div className="p-6 border-b border-[#2c2c2c] flex items-center justify-between bg-[#121212]">
+            <div className="flex items-center gap-3">
+                <Logo />
+                <div className={`${!sidebarOpen && 'hidden'}`}>
+                    <h1 className="font-bold text-lg tracking-tight text-white">{T.sidebarTitle}</h1>
+                    <span className="text-xs text-cf-orange font-bold tracking-widest uppercase">{T.sidebarSubtitle}</span>
+                </div>
+            </div>
         </div>
+
+        {/* Language Switcher */}
+        {sidebarOpen && (
+            <div className="px-4 pt-4">
+                <div className="flex bg-[#1f1f1f] p-1 rounded-lg border border-[#333]">
+                    <button 
+                        onClick={() => setLanguage('tr')}
+                        className={`flex-1 py-1 text-xs font-bold rounded-md transition-all ${language === 'tr' ? 'bg-[#333] text-white shadow-sm' : 'text-gray-500 hover:text-gray-300'}`}
+                    >
+                        TÜRKÇE
+                    </button>
+                    <button 
+                         onClick={() => setLanguage('en')}
+                         className={`flex-1 py-1 text-xs font-bold rounded-md transition-all ${language === 'en' ? 'bg-[#333] text-white shadow-sm' : 'text-gray-500 hover:text-gray-300'}`}
+                    >
+                        ENGLISH
+                    </button>
+                </div>
+            </div>
+        )}
 
         {/* Search Box */}
         <div className={`p-4 ${!sidebarOpen && 'hidden'}`}>
@@ -362,26 +384,25 @@ const App: React.FC = () => {
                     type="text" 
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="Konu veya araç ara..."
+                    placeholder={T.searchPlaceholder}
                     className="w-full bg-[#1f1f1f] border border-[#333] rounded-lg pl-9 pr-3 py-2 text-sm text-white focus:border-cf-orange focus:ring-1 focus:ring-cf-orange focus:outline-none transition-all"
                 />
                 <svg className="absolute left-3 top-2.5 text-gray-500 w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
             </div>
         </div>
 
-        {/* Status Bar for Queue */}
+        {/* Status Bar */}
         {(processingQueue.length > 0 || activeRequests.length > 0) && sidebarOpen && (
             <div className="px-4 py-2 bg-[#1a1a1a] border-y border-[#2c2c2c] flex items-center justify-between text-xs">
                <div className="flex items-center gap-2">
                    <div className="flex gap-1">
                      <div className="w-1.5 h-1.5 bg-cf-orange rounded-full animate-pulse"></div>
                    </div>
-                   <span className="text-gray-400">İşleniyor: <span className="text-cf-orange font-bold">{activeRequests.length}</span> / Sırada: <span className="text-white font-bold">{processingQueue.length}</span></span>
+                   <span className="text-gray-400">{T.processing}: <span className="text-cf-orange font-bold">{activeRequests.length}</span> / {T.queued}: <span className="text-white font-bold">{processingQueue.length}</span></span>
                </div>
                <button 
                  onClick={handleClearQueue} 
                  className="text-red-400 hover:text-red-300 hover:bg-red-900/20 rounded p-1"
-                 title="Sırayı Temizle"
                >
                    <XCircle />
                </button>
@@ -398,7 +419,7 @@ const App: React.FC = () => {
                 <span className={`${activeCategory === category.id ? 'text-cf-orange' : 'text-gray-500'}`}>
                    {getCategoryIcon(category.id)}
                 </span>
-                <span className={`font-bold uppercase tracking-wide text-xs flex-1 ${!sidebarOpen && 'hidden'}`}>{category.title}</span>
+                <span className={`font-bold uppercase tracking-wide text-xs flex-1 ${!sidebarOpen && 'hidden'}`}>{category.title[language]}</span>
                 {sidebarOpen && <ChevronRight />}
               </div>
               
@@ -409,9 +430,11 @@ const App: React.FC = () => {
                     const isActive = activeTopic?.id === topic.id;
                     const isProcessing = isTopicProcessing(topic.id);
                     const isQueued = isTopicQueued(topic.id);
-                    // Check if content is different from static
-                    const isCustom = contentCache[topic.id] && contentCache[topic.id].content !== STATIC_TUTORIALS[topic.id]?.content;
-                    const isCached = !!contentCache[topic.id];
+                    
+                    // Check cache for current language
+                    const cachedItem = contentCache[topic.id]?.[language];
+                    // If it exists and differs from default static (not really needed logic anymore as static is default, but good for "updated" check if we implemented versioning)
+                    const isCached = !!cachedItem;
 
                     return (
                       <button
@@ -431,14 +454,13 @@ const App: React.FC = () => {
                            ) : (
                                 <div className={`w-2 h-2 rounded-full transition-colors duration-300
                                     ${isCompleted ? 'bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.5)]' : 
-                                    (isCached && isCustom) ? 'bg-purple-500 shadow-[0_0_5px_rgba(168,85,247,0.5)]' :
                                     isCached ? 'bg-blue-500/50' : 'bg-[#363636]'}`}>
                                 </div>
                            )}
                         </div>
 
                         <div className="flex-1 min-w-0 flex justify-between items-center">
-                          <div className={`font-medium truncate ${isCompleted && !isActive ? 'line-through opacity-50' : ''}`}>{topic.title}</div>
+                          <div className={`font-medium truncate ${isCompleted && !isActive ? 'line-through opacity-50' : ''}`}>{topic.title[language]}</div>
                         </div>
                       </button>
                     )
@@ -448,18 +470,17 @@ const App: React.FC = () => {
             </div>
           ))}
           {filteredCurriculum.length === 0 && (
-              <div className="text-center text-gray-500 text-sm mt-4">Sonuç bulunamadı</div>
+              <div className="text-center text-gray-500 text-sm mt-4">{T.resultsNotFound}</div>
           )}
         </div>
 
-        {/* Settings Button */}
         <div className="p-4 border-t border-[#2c2c2c] bg-[#121212]">
             <button 
                 onClick={() => setIsSettingsOpen(true)}
                 className={`flex items-center gap-3 w-full px-3 py-2 text-sm text-gray-400 hover:text-white hover:bg-[#1f1f1f] rounded-lg transition-colors ${!sidebarOpen && 'justify-center'}`}
             >
                 <Settings />
-                {sidebarOpen && <span>Ayarlar & Araçlar</span>}
+                {sidebarOpen && <span>{T.settingsTitle}</span>}
             </button>
         </div>
       </div>
@@ -475,12 +496,12 @@ const App: React.FC = () => {
             </button>
             {activeTopic && (
                <div className="flex flex-col animate-fadeIn">
-                  <span className="text-xs text-gray-500 font-mono uppercase">Şu an inceleniyor</span>
+                  <span className="text-xs text-gray-500 font-mono uppercase">{T.currentlyViewing}</span>
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-bold text-white truncate max-w-[300px]">{activeTopic.title}</span>
+                    <span className="text-sm font-bold text-white truncate max-w-[300px]">{activeTopic.title[language]}</span>
                     {(isTopicProcessing(activeTopic.id) || isTopicQueued(activeTopic.id)) && (
                         <span className="text-xs text-cf-orange animate-pulse border border-cf-orange/50 px-1 rounded">
-                            {isTopicProcessing(activeTopic.id) ? 'YENİLENİYOR...' : 'SIRADA...'}
+                            {isTopicProcessing(activeTopic.id) ? T.statusRegenerating : T.statusQueued}
                         </span>
                     )}
                   </div>
@@ -495,17 +516,16 @@ const App: React.FC = () => {
                     onClick={() => activeTopic && handleRegenerate(activeTopic)}
                     disabled={activeTopic && (isTopicProcessing(activeTopic.id) || isTopicQueued(activeTopic.id))}
                     className="flex items-center gap-2 px-3 py-2 text-xs font-bold text-gray-400 hover:text-white hover:bg-[#2c2c2c] rounded transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-                    title="İçeriği Yapay Zeka ile Yeniden Oluştur"
                   >
                     <svg className={`${activeTopic && isTopicProcessing(activeTopic.id) ? 'animate-spin' : ''}`} width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M23 4v6h-6"></path><path d="M1 20v-6h6"></path><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
-                    {activeTopic && isTopicProcessing(activeTopic.id) ? 'İŞLENİYOR' : 'YENİLE'}
+                    {activeTopic && isTopicProcessing(activeTopic.id) ? T.btnProcessing : T.btnRegenerate}
                   </button>
                   <button 
                     onClick={downloadPDF}
                     disabled={isPdfGenerating}
                     className="flex items-center gap-2 px-4 py-2 text-xs font-bold text-gray-300 bg-[#1f1f1f] border border-[#363636] rounded hover:bg-[#2c2c2c] transition-all"
                   >
-                    {isPdfGenerating ? '...' : 'PDF İNDİR'}
+                    {isPdfGenerating ? '...' : T.btnDownloadPdf}
                   </button>
                   <button 
                     onClick={() => activeTopic && toggleComplete(activeTopic.id)}
@@ -514,7 +534,7 @@ const App: React.FC = () => {
                         ? 'bg-green-900/20 text-green-400 border-green-800 hover:bg-green-900/30' 
                         : 'bg-cf-orange text-white border-transparent hover:bg-orange-600'}`}
                   >
-                    {activeTopic && completedTopics.includes(activeTopic.id) ? 'TAMAMLANDI' : 'TAMAMLA'}
+                    {activeTopic && completedTopics.includes(activeTopic.id) ? T.btnCompleted : T.btnComplete}
                   </button>
                 </>
              )}
@@ -529,14 +549,13 @@ const App: React.FC = () => {
                 <div className="w-24 h-24 bg-[#1a1a1a] rounded-2xl flex items-center justify-center mb-8 border border-[#333] shadow-[0_0_30px_rgba(243,128,32,0.1)]">
                   <Logo />
                 </div>
-                <h2 className="text-5xl font-extrabold text-white mb-6 tracking-tight">Cloudflare <span className="text-cf-orange">MasterClass</span></h2>
+                <h2 className="text-5xl font-extrabold text-white mb-6 tracking-tight">{T.welcomeTitle} <span className="text-cf-orange">{T.welcomeSubtitle}</span></h2>
                 <p className="text-gray-400 text-lg mb-10 max-w-2xl leading-relaxed">
-                  İnternet altyapısının geleceğini şekillendiren teknolojileri öğrenin. 
+                  {T.welcomeDesc}
                 </p>
                 
-                {/* Search Recommendation Chips */}
                 <div className="flex flex-wrap justify-center gap-2 mb-8 max-w-2xl">
-                    {['Workers', 'WAF Kuralları', 'DDoS', 'R2 Storage', 'Terraform', 'Zero Trust'].map(tag => (
+                    {['Workers', 'WAF', 'DDoS', 'R2 Storage', 'Terraform', 'Zero Trust'].map(tag => (
                         <button 
                             key={tag}
                             onClick={() => setSearchQuery(tag)}
@@ -549,7 +568,7 @@ const App: React.FC = () => {
              </div>
           )}
 
-          {/* Loading State: If no content AND (processing OR queued) */}
+          {/* Loading State */}
           {activeTopic && !activeContent && (isTopicProcessing(activeTopic.id) || isTopicQueued(activeTopic.id)) && (
             <div className="max-w-4xl mx-auto p-12 space-y-8 animate-fadeIn flex flex-col items-center justify-center h-full">
               <div className="relative">
@@ -560,10 +579,10 @@ const App: React.FC = () => {
               </div>
               <div className="text-center">
                   <span className="text-xl font-mono text-cf-orange block mb-2">
-                    {isTopicProcessing(activeTopic.id) ? 'İçerik Hazırlanıyor...' : 'Sırada Bekliyor...'}
+                    {isTopicProcessing(activeTopic.id) ? T.loadingAI : T.loadingQueue}
                   </span>
                   <p className="text-gray-500 text-sm max-w-md">
-                    Cloudflare AI modelleri sizin için en güncel bilgileri derliyor. Bu sırada diğer konulara göz atabilirsiniz.
+                    {T.loadingDesc}
                   </p>
               </div>
             </div>
@@ -571,11 +590,11 @@ const App: React.FC = () => {
 
           {activeContent && (
             <div className="p-8 md:p-12 pb-32 animate-slideUp">
-              {/* If regenerating in background, show overlay hint */}
+              {/* Background Process Warning */}
               {(isTopicProcessing(activeTopic!.id) || isTopicQueued(activeTopic!.id)) && (
                   <div className="bg-cf-orange/10 border border-cf-orange/20 text-cf-orange p-3 rounded-lg mb-6 text-sm flex items-center gap-3 animate-pulse">
                       <div className="w-2 h-2 bg-cf-orange rounded-full"></div>
-                      Arka planda daha yeni bir versiyon hazırlanıyor...
+                      {T.backgroundProcess}
                   </div>
               )}
 
@@ -603,7 +622,7 @@ const App: React.FC = () => {
                 </div>
 
                 <div className="mt-12 pt-8 border-t border-[#2c2c2c] flex justify-between items-end text-gray-500 text-xs font-mono">
-                   <div>Generated by Cloudflare MasterClass AI</div>
+                   <div>{T.generatedBy}</div>
                 </div>
               </div>
 
@@ -617,6 +636,7 @@ const App: React.FC = () => {
         messages={chatMessages}
         onSendMessage={handleChat}
         isLoading={isChatLoading}
+        labels={{ title: T.chatTitle, placeholder: T.chatPlaceholder, empty: T.chatEmpty, quote: T.quoteSelection }}
       />
 
     </div>

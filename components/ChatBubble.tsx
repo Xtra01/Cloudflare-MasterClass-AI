@@ -1,3 +1,4 @@
+
 import React, { useState, useRef, useEffect } from 'react';
 import { ChatMessage } from '../types';
 import MarkdownRenderer from './MarkdownRenderer';
@@ -7,9 +8,15 @@ interface Props {
   messages: ChatMessage[];
   onSendMessage: (text: string) => void;
   isLoading: boolean;
+  labels: {
+    title: string;
+    placeholder: string;
+    empty: string;
+    quote: string;
+  }
 }
 
-const ChatBubble: React.FC<Props> = ({ messages, onSendMessage, isLoading }) => {
+const ChatBubble: React.FC<Props> = ({ messages, onSendMessage, isLoading, labels }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [input, setInput] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -33,7 +40,7 @@ const ChatBubble: React.FC<Props> = ({ messages, onSendMessage, isLoading }) => 
   const handlePasteSelection = () => {
     const selection = window.getSelection()?.toString();
     if (selection) {
-      setInput((prev) => prev + (prev ? '\n\n' : '') + `> "${selection}"\n\nBu kısımla ilgili sorum şu: `);
+      setInput((prev) => prev + (prev ? '\n\n' : '') + `> "${selection}"\n\n... `);
       inputRef.current?.focus();
     }
   };
@@ -50,7 +57,7 @@ const ChatBubble: React.FC<Props> = ({ messages, onSendMessage, isLoading }) => 
         <div className="bg-[#1f1f1f] p-4 border-b border-[#333] flex items-center justify-between">
             <div className="flex items-center gap-2">
                 <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
-                <span className="font-bold text-white text-sm">Cloudflare Asistanı</span>
+                <span className="font-bold text-white text-sm">{labels.title}</span>
             </div>
             <button onClick={() => setIsOpen(false)} className="text-gray-400 hover:text-white">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
@@ -62,7 +69,7 @@ const ChatBubble: React.FC<Props> = ({ messages, onSendMessage, isLoading }) => 
             {messages.length === 0 && (
                 <div className="text-center text-gray-500 text-sm mt-10">
                     <Sparkles />
-                    <p className="mt-2">İçerikle ilgili takıldığınız yerleri sorun.</p>
+                    <p className="mt-2">{labels.empty}</p>
                 </div>
             )}
             {messages.map((msg) => (
@@ -97,7 +104,7 @@ const ChatBubble: React.FC<Props> = ({ messages, onSendMessage, isLoading }) => 
                     onClick={handlePasteSelection}
                     className="text-[10px] bg-[#2c2c2c] hover:bg-[#363636] text-gray-300 px-2 py-1 rounded border border-[#363636] whitespace-nowrap transition-colors"
                  >
-                    + Seçimi Alıntıla
+                    {labels.quote}
                  </button>
             </div>
             <form onSubmit={handleSubmit} className="flex gap-2">
@@ -106,7 +113,7 @@ const ChatBubble: React.FC<Props> = ({ messages, onSendMessage, isLoading }) => 
                     type="text"
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
-                    placeholder="Bir soru sorun..."
+                    placeholder={labels.placeholder}
                     className="flex-1 bg-[#0d0d0d] border border-[#333] rounded-md px-3 py-2 text-white text-sm focus:outline-none focus:border-[#F38020]"
                 />
                 <button 
